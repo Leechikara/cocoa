@@ -1,7 +1,8 @@
 '''
 Load data, learn model and evaluate
 '''
-
+import sys
+sys.path.append('..')
 import argparse
 import random
 import os

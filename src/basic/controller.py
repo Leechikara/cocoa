@@ -22,6 +22,46 @@ class Controller(object):
         self.reward = 0
         self.events = []
 
+    def simulate_rl(self, max_turns=100):
+        '''Simulate the dialogue.'''
+        self.events = []
+        time = 0
+        self.selections = [None, None]
+        self.reward = 0
+        num_turns = 0
+        timeup = False
+        while True:
+            for agent, session in enumerate(self.sessions):
+                event = session.send()
+                time += 1
+                if not event:
+                    continue
+                event.time = time
+                self.events.append(event)
+
+                if event.action == 'select':
+                    self.selections[agent] = event.data
+
+                print 'agent=%s: session=%s, event=%s' % (agent, type(session).__name__, event.to_dict())
+                num_turns += 1
+                if num_turns >= max_turns:
+                    timeup = True
+                for partner, other_session in enumerate(self.sessions):
+                    if agent != partner:
+                        other_session.receive(event)
+
+                # Game is over when the two selections are the same
+                if self.game_over():
+                    self.reward = 1
+                    break
+            if self.game_over() or timeup:
+                break
+
+        uuid = generate_uuid('E')
+        outcome = {'reward': self.reward}
+        print 'outcome: %s' % outcome
+        return Example(self.scenario, uuid, self.events, outcome, uuid, None)
+
     def simulate(self, max_turns=100):
         '''Simulate the dialogue.'''
         self.events = []

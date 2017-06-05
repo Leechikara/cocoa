@@ -9,7 +9,7 @@ from fuzzywuzzy import fuzz
 from lexicon_utils import get_prefixes, get_acronyms, get_edits, get_morphological_variants
 
 def add_lexicon_arguments(parser):
-    parser.add_argument('--stop-words', type=str, default='data/common_words.txt', help='Path to stop words list')
+    parser.add_argument('--stop-words', type=str, default='../data/common_words.txt', help='Path to stop words list')
     parser.add_argument('--learned-lex', default=False, action='store_true', help='if true have entity linking in lexicon use learned system')
     parser.add_argument('--inverse-lexicon', help='Path to inverse lexicon data')
 

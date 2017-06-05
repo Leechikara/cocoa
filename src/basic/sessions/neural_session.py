@@ -9,6 +9,9 @@ import random
 import re
 from itertools import izip
 
+
+from src.basic.controller import Controller
+
 num_to_word = {v: k for k, v in word_to_num.iteritems()}
 
 class NeuralSession(Session):
@@ -128,6 +131,134 @@ class NeuralSession(Session):
         tokens = self.naturalize(tokens)
         s = self.attach_punct(' '.join(tokens))
         return self.message(s)
+
+class RNNNeuralRLSession(NeuralSession):
+    '''
+    RNN Session use the vanila seq2seq model without graphs.
+    '''
+    def __init__(self, agent, kb, env):
+        super(RNNNeuralSession, self).__init__(agent, kb, env)
+        self.encoder_state = None
+        self.decoder_state = None
+        self.encoder_output_dict = None
+
+        self.new_turn = False
+        self.end_turn = False
+
+        self.sent_entity = False
+        self.selected_items = set()
+
+    @classmethod
+    def _get_last_inds(cls, inputs):
+        '''
+        For batch_size=1, just return the last index.
+        '''
+        return np.ones(inputs.shape[0], dtype=np.int32) * (inputs.shape[1] - 1)
+
+    def _process_entity_tokens(self, entity_tokens, stage):
+        int_inputs = np.reshape(self.env.textint_map.text_to_int(entity_tokens), [1, -1])
+        inputs, entities = self.env.textint_map.process_entity(int_inputs, stage)
+        return inputs, entities
+
+    def _encoder_args(self, entity_tokens):
+        #inputs = np.reshape(self.env.textint_map.text_to_int(entity_tokens, 'encoding'), [1, -1])
+        inputs, entities = self._process_entity_tokens(entity_tokens, 'encoding')
+        #self.log.write('encoder entities:%s\n' % str(entities))
+        encoder_args = {'inputs': inputs,
+                'last_inds': self._get_last_inds(inputs),
+                'init_state': self.encoder_state,
+                'entities': entities,
+                }
+        return encoder_args
+
+    def _decoder_init_state(self, sess):
+        return self.encoder_state
+
+    def _decoder_args(self, init_state, inputs):
+        decoder_args = {'inputs': inputs,
+                'last_inds': np.zeros([1], dtype=np.int32),
+                'init_state': init_state,
+                'textint_map': self.env.textint_map,
+                }
+        return decoder_args
+
+    def _update_states(self, sess, decoder_output_dict, entity_tokens):
+        self.decoder_state = decoder_output_dict['final_state']
+        self.encoder_state = decoder_output_dict['final_state']
+
+    def decode(self):
+        sess = self.env.tf_session
+
+        if self.encoder_output_dict is None:
+            self.encode([markers.EOS])
+
+        if self.new_turn:
+            # If this is a new turn, we need to continue from the encoder outputs, thus need
+            # to compute init_state (including attention and context). GO indicates a new turn
+            # as opposed to EOS within a turn.
+            start_symbol = markers.GO
+            init_state = self._decoder_init_state(sess)
+        else:
+            assert self.decoder_state is not None
+            init_state = self.decoder_state
+            start_symbol = markers.EOS
+
+        inputs = np.reshape(self.env.textint_map.text_to_int([start_symbol], 'decoding'), [1, 1])
+
+        decoder_args = self._decoder_args(init_state, inputs)
+        decoder_output_dict = self.model.decoder.decode(sess, self.env.max_len, batch_size=1, stop_symbol=self.env.stop_symbol, **decoder_args)
+
+        entity_tokens = self._pred_to_token(decoder_output_dict['preds'])[0]
+        if not self._is_valid(entity_tokens):
+            return None
+        #self.log.write('decode:%s\n' % str(entity_tokens))
+        self._update_states(sess, decoder_output_dict, entity_tokens)
+
+        # Text message
+        if self.new_turn:
+            self.new_turn = False
+        return entity_tokens
+        #return [x if not is_entity(x) else x[0] for x in entity_tokens]
+
+    def _is_valid(self, tokens):
+        if not tokens:
+            return False
+        if Vocabulary.UNK in tokens:
+            return False
+        if tokens[0] == markers.SELECT:
+            if len(tokens) > 1 and isinstance(tokens[1], tuple) and tokens[1][0].startswith('item-'):
+                item_id = int(tokens[1][0].split('-')[1])
+                if item_id in self.selected_items or item_id >= len(self.kb.items):
+                    return False
+                else:
+                    return True
+            else:
+                return False
+        else:
+            for token in tokens:
+                if isinstance(token, tuple) and token[0].startswith('item-'):
+                    return False
+        return True
+
+    def encode(self, entity_tokens):
+        encoder_args = self._encoder_args(entity_tokens)
+        #self.log.write('encode:%s\n' % str(entity_tokens))
+        self.encoder_output_dict = self.model.encoder.encode(self.env.tf_session, **encoder_args)
+        self.encoder_state = self.encoder_output_dict['final_state']
+        self.new_turn = True
+
+    def _pred_to_token(self, preds):
+        if self.env.copy:
+            preds = self.graph.copy_preds(preds, self.env.vocab.size)
+        entity_tokens, _ = pred_to_token(preds, self.env.stop_symbol, self.env.remove_symbols, self.env.textint_map)
+        entity_tokens = [[(x[0], x) if is_entity(x) else x for x in toks] for toks in entity_tokens]
+        return entity_tokens
+
+    def _match(self, item):
+        for it in self.kb.items:
+            if it == item:
+                return it
+        return None
 
 class RNNNeuralSession(NeuralSession):
     '''

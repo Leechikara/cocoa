@@ -4,7 +4,7 @@ import os
 import argparse
 import tensorflow as tf
 from src.basic.systems.system import System
-from src.basic.sessions.neural_session import RNNNeuralSession, GraphNeuralSession
+from src.basic.sessions.neural_session import RNNNeuralSession, RNNNeuralRLSession, GraphNeuralSession
 from src.basic.sessions.timed_session import TimedSessionWrapper
 from src.basic.util import read_pickle, read_json
 from src.model.encdec import build_model
@@ -55,7 +55,8 @@ class NeuralSystem(System):
 
         # NOTE: need to close the session when done
         tf_session = tf.Session(config=config)
-        tf.initialize_all_variables().run(session=tf_session)
+        # tf.initialize_all_variables().run(session=tf_session)
+        tf_session.run(tf.global_variables_initializer())
 
         # Load TF model parameters
         ckpt = tf.train.get_checkpoint_state(model_path+'-best')
@@ -92,3 +93,13 @@ class NeuralSystem(System):
         if self.timed_session:
             session = TimedSessionWrapper(agent, session)
 	return session
+
+    def new_rl_session(self, agent, kb):
+        if self.model_name == 'encdec':
+            session = RNNNeuralRLSession(agent , kb, self.env)
+        else:
+            session = GraphNeuralSession(agent, kb, self.env)
+        if self.timed_session:
+            session = TimedSessionWrapper(agent, session)
+    return session
+

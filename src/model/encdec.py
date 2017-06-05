@@ -627,6 +627,226 @@ class CopyGraphDecoder(GraphDecoder):
         preds = textint_map.pred_to_input(preds)
         return preds
 
+
+class GraphDecoderRL(GraphEncoder):
+    '''
+    Decoder with attention mechanism over the graph.
+    '''
+    def __init__(self, rnn_size, num_symbols, graph_embedder, rnn_type='lstm', num_layers=1, dropout=0, bow_utterance=False, scoring='linear', output='project', checklist=True, sample_t=0, sample_select=None, node_embed_in_rnn_inputs=False, update_graph=True):
+        super(GraphDecoder, self).__init__(rnn_size, graph_embedder, rnn_type, num_layers, dropout, bow_utterance, node_embed_in_rnn_inputs, update_graph)
+        self.sampler = Sampler(sample_t, sample_select)
+        self.num_symbols = num_symbols
+        self.utterance_id = 1
+        self.scorer = scoring
+        self.output_combiner = output
+        self.checklist = checklist
+
+    def compute_loss(self, targets, pad, select):
+        logits = self.output_dict['logits']
+        loss, seq_loss, total_loss = BasicDecoder._compute_loss(logits, targets, pad)
+        # -1 is selection loss
+        return loss, seq_loss, total_loss, tf.constant(-1)
+
+    def _build_rnn_cell(self):
+        return AttnRNNCell(self.rnn_size, self.context_size, self.rnn_type, self.keep_prob, self.scorer, self.output_combiner, self.num_layers, self.checklist)
+
+    def _build_init_output(self, cell):
+        '''
+        Output includes both RNN output and attention scores.
+        '''
+        output = super(GraphDecoder, self)._build_init_output(cell)
+        return (output, tf.zeros_like(self.graph_embedder.node_ids, dtype=tf.float32))
+
+    def _build_output(self, output_dict):
+        '''
+        Take RNN outputs and produce logits over the vocab.
+        '''
+        outputs = output_dict['outputs']
+        outputs = transpose_first_two_dims(outputs)  # (batch_size, seq_len, output_size)
+        logits = batch_linear(outputs, self.num_symbols, True)
+        #logits = BasicDecoder.penalize_repetition(logits)
+        return logits
+
+    def _build_init_state(self, cell, input_dict):
+        self.init_output = input_dict['init_output']
+        self.init_rnn_state = input_dict['init_state']
+        if self.init_rnn_state is not None:
+            # NOTE: we assume that the initial state comes from the encoder and is just
+            # the rnn state. We need to compute attention and get context for the attention
+            # cell's initial state.
+            return cell.init_state(self.init_rnn_state, self.init_output, self.context, tf.cast(self.init_checklists[:, 0, :], tf.float32))
+        else:
+            return cell.zero_state(self.batch_size, self.context)
+
+    # TODO: hacky interface
+    def compute_init_state(self, sess, init_rnn_state, init_output, context, init_checklists):
+        init_state = sess.run(self.init_state,
+                feed_dict={self.init_output: init_output,
+                    self.init_rnn_state: init_rnn_state,
+                    self.context: context,
+                    self.init_checklists: init_checklists,}
+                )
+        return init_state
+
+    def _build_inputs(self, input_dict):
+        super(GraphDecoder, self)._build_inputs(input_dict)
+        with tf.name_scope(type(self).__name__+'/inputs'):
+            self.matched_items = tf.placeholder(tf.int32, shape=[None], name='matched_items')
+            self.init_checklists = tf.placeholder(tf.int32, shape=[None, None, None], name='init_checklists')
+
+    def _build_rnn_inputs(self, word_embedder, time_major):
+        inputs = super(GraphDecoder, self)._build_rnn_inputs(word_embedder, time_major)
+
+        checklists = tf.cumsum(tf.one_hot(self.entities, self.num_nodes, on_value=1, off_value=0), axis=1) + self.init_checklists
+        # cumsum can cause >1 indicator
+        checklists = tf.cast(tf.greater(checklists, 0), tf.float32)
+        self.output_dict['checklists'] = checklists
+
+        checklists = transpose_first_two_dims(checklists)  # (seq_len, batch_size, num_nodes)
+        return inputs, checklists
+
+    def build_model(self, word_embedder, input_dict, time_major=True, scope=None):
+        super(GraphDecoder, self).build_model(word_embedder, input_dict, time_major=time_major, scope=scope)  # outputs: (seq_len, batch_size, output_size)
+        with tf.variable_scope(scope or type(self).__name__):
+            logits = self._build_output(self.output_dict)
+        self.output_dict['logits'] = logits
+        self.output_dict['probs'] = tf.nn.softmax(logits)
+
+    def _build_output_dict(self, rnn_outputs, rnn_states):
+        final_state = self._get_final_state(rnn_states)
+        outputs, attn_scores = rnn_outputs
+        self.output_dict.update({'outputs': outputs, 'attn_scores': attn_scores, 'final_state': final_state})
+
+    def get_feed_dict(self, **kwargs):
+        feed_dict = super(GraphDecoder, self).get_feed_dict(**kwargs)
+        feed_dict[self.init_checklists] = kwargs.pop('init_checklists')
+        optional_add(feed_dict, self.matched_items, kwargs.pop('matched_items', None))
+        return feed_dict
+
+    def pred_to_input(self, preds, **kwargs):
+        '''
+        Convert predictions to input of the next decoding step.
+        '''
+        textint_map = kwargs.pop('textint_map')
+        inputs = textint_map.pred_to_input(preds)
+        return inputs
+
+    def pred_to_entity(self, pred, graphs, vocab):
+        return graphs.pred_to_entity(pred, vocab.size)
+
+    def decode(self, sess, max_len, batch_size=1, stop_symbol=None, **kwargs):
+        if stop_symbol is not None:
+            assert batch_size == 1, 'Early stop only works for single instance'
+        feed_dict = self.get_feed_dict(**kwargs)
+        cl = kwargs['init_checklists']
+        preds = np.zeros([batch_size, max_len], dtype=np.int32)
+        generated_word_types = None
+        # last_inds=0 because input length is one from here on
+        last_inds = np.zeros([batch_size], dtype=np.int32)
+        attn_scores = []
+        probs = []
+        graphs = kwargs['graphs']
+        vocab = kwargs['vocab']
+        select = vocab.to_ind(markers.SELECT)
+        word_embeddings = 0
+
+        for i in xrange(max_len):
+            # NOTE: since we're running for one step, utterance_embedding is essentially word_embedding
+            output_nodes = [self.output_dict['logits'], self.output_dict['final_state'], self.output_dict['final_output'], self.output_dict['utterance_embedding'], self.output_dict['attn_scores'], self.output_dict['probs'], self.output_dict['checklists']]
+            if 'selection_scores' in self.output_dict:
+                output_nodes.append(self.output_dict['selection_scores'])
+
+            if 'selection_scores' in self.output_dict:
+                logits, final_state, final_output, utterance_embedding, attn_score, prob, cl, selection_scores = sess.run(output_nodes, feed_dict=feed_dict)
+            else:
+                logits, final_state, final_output, utterance_embedding, attn_score, prob, cl = sess.run(output_nodes, feed_dict=feed_dict)
+
+            word_embeddings += utterance_embedding
+            # attn_score: seq_len x batch_size x num_nodes, seq_len=1, so we take attn_score[0]
+            attn_scores.append(attn_score[0])
+            # probs: batch_size x seq_len x num_symbols
+            probs.append(prob[:, 0, :])
+            step_preds = self.sampler.sample(logits, prev_words=None)
+
+            if generated_word_types is None:
+                generated_word_types = np.zeros([batch_size, logits.shape[2]])
+            generated_word_types[np.arange(batch_size), step_preds[:, 0]] = 1
+
+            preds[:, [i]] = step_preds
+            if step_preds[0][0] == stop_symbol:
+                break
+            entities = self.pred_to_entity(step_preds, graphs, vocab)
+
+            feed_dict = self.get_feed_dict(inputs=self.pred_to_input(step_preds, **kwargs),
+                    last_inds=last_inds,
+                    init_state=final_state,
+                    init_checklists=cl,
+                    entities=entities,
+                    )
+        # NOTE: the final_output may not be at the stop symbol when the function is running
+        # in batch mode -- it will be the state at max_len. This is fine since during test
+        # we either run with batch_size=1 (real-time chat) or use the ground truth to update
+        # the state (see generate()).
+        output_dict = {'preds': preds, 'final_state': final_state, 'final_output': final_output, 'attn_scores': attn_scores, 'probs': probs, 'utterance_embedding': word_embeddings, 'checklists': cl}
+        if 'selection_scores' in self.output_dict:
+            output_dict['selection_scores'] = selection_scores
+        return output_dict
+
+    def _print_cl(self, cl):
+        print 'checklists:'
+        for i in xrange(cl.shape[0]):
+            nodes = []
+            for j, c in enumerate(cl[i][0]):
+                if c != 0:
+                    nodes.append(j)
+            if len(nodes) > 0:
+                print i, nodes
+
+    def _print_copied_nodes(self, cn):
+        print 'copied_nodes:'
+        cn, mask = cn
+        for i, (c, m) in enumerate(zip(cn, mask)):
+            if m:
+                print i, c
+
+    def update_context(self, sess, entities, final_output, utterance_embedding, utterances, graph_data):
+        feed_dict = {self.update_entities: entities,
+                self.output_dict['final_output']: final_output,
+                self.output_dict['utterance_embedding']: utterance_embedding,
+                self.utterances: utterances}
+        feed_dict = self.graph_embedder.get_feed_dict(feed_dict=feed_dict, **graph_data)
+        new_utterances, new_context = sess.run([self.output_dict['utterances'], self.output_dict['context']], feed_dict=feed_dict)
+        return new_utterances, new_context
+
+class CopyGraphDecoderRL(GraphDecoder):
+    '''
+    Decoder with copy mechanism over the attention context.
+    '''
+    def _build_output(self, output_dict):
+        '''
+        Take RNN outputs and produce logits over the vocab and the attentions.
+        '''
+        logits = super(CopyGraphDecoder, self)._build_output(output_dict)  # (batch_size, seq_len, num_symbols)
+        attn_scores = transpose_first_two_dims(output_dict['attn_scores'])  # (batch_size, seq_len, num_nodes)
+        return tf.concat(2, [logits, attn_scores])
+
+    def pred_to_entity(self, pred, graphs, vocab):
+        '''
+        Return copied nodes for a single time step.
+        '''
+        offset = vocab.size
+        pred = graphs.copy_preds(pred, offset)
+        node_ids = graphs._pred_to_node_id(pred, offset)
+        return node_ids
+
+    def pred_to_input(self, preds, **kwargs):
+        graphs = kwargs.pop('graphs')
+        vocab = kwargs.pop('vocab')
+        textint_map = kwargs.pop('textint_map')
+        preds = graphs.copy_preds(preds, vocab.size)
+        preds = textint_map.pred_to_input(preds)
+        return preds
+
 class BasicEncoderDecoder(object):
     '''
     Basic seq2seq model.
